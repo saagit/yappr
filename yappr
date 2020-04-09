@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+# pylint: disable=C0111
+
+import datetime
+import io
+from pathlib import Path
+import re
+import sys
+
+import argparse
+import configparser
+import urllib.parse
+import urllib.request
+
+import mutagen
+from mutagen.id3 import Encoding, APIC, TALB, TCON, TIT2, TLEN, TPE1
+from PIL import Image
+import podcastparser
+
+PROG_DESCRIPTION = 'yappr: Yet Another Python Podcast Retriever'
+
+def get_args():
+    argp = argparse.ArgumentParser(description=PROG_DESCRIPTION)
+    argp.add_argument('-F', '--config-file',
+                      default=Path('~/.podcasts/config').expanduser(),
+                      help='The configuration file to use.')
+    argp.add_argument('-c', '--config-section', default='DEFAULT',
+                      help='The section of the configuration file to use.')
+    argp.add_argument('-D', '--download-directory',
+                      help='Directory to download podcasts to.')
+    argp.add_argument('-G', '--GUID-file',
+                      help='File to track the GUIDs of downloaded podcasts.')
+    argp.add_argument('-n', '--dry-run', action='store_true',
+                      help='Do not write to local files (same as -d -g).')
+    argp.add_argument('-d', '--download-skip', action='store_true',
+                      help='Do not download podcasts.')
+    argp.add_argument('-g', '--GUID-skip', action='store_true',
+                      help='Do not write GUIDs to GUID-file.')
+    argp.add_argument('-q', '--quiet', action='store_true',
+                      help='Do not print episode titles.')
+    argp.add_argument('feeds', metavar='FEED', nargs='*',
+                      help='Fetch FEEDs instead of '
+                      'feeds from configuration file.')
+    args = argp.parse_args()
+
+    valid_config_keys = {
+        'download directory',
+        'guid file',
+        'dry run',
+        'download skip',
+        'guid skip',
+        'feeds'
+        }
+    config_defaults = {
+        'download directory': Path('~/.podcasts/download').expanduser(),
+        'guid file': Path('~/.podcasts/GUIDs').expanduser()
+        }
+    cfgp = configparser.ConfigParser(config_defaults)
+    cfgp.read(args.config_file)
+    cfg = cfgp[args.config_section]
+    invalid_config_keys = set(cfg) - valid_config_keys
+    if invalid_config_keys:
+        print(f'Ignoring the following invalid key(s) in {args.config_file}:',
+              file=sys.stderr)
+        for key in sorted(invalid_config_keys):
+            print(f' "{key}"', file=sys.stderr)
+        print(f'Valid config keys:', file=sys.stderr)
+        for key in sorted(valid_config_keys):
+            print(f' "{key}"', file=sys.stderr)
+
+    if not args.feeds:
+        args.feeds = [feed for feed in cfg['Feeds'].splitlines() if feed]
+
+    if args.download_directory:
+        args.download_directory = Path(args.download_directory)
+    else:
+        args.download_directory = Path(cfg['download directory']).expanduser()
+
+    if args.GUID_file:
+        args.GUID_file = Path(args.GUID_file)
+    else:
+        args.GUID_file = Path(cfg['guid file']).expanduser()
+
+    if cfgp.getboolean(args.config_section, 'dry run', fallback=False):
+        args.dry_run = True
+
+    if cfgp.getboolean(args.config_section, 'download skip', fallback=False):
+        args.download_skip = True
+
+    if cfgp.getboolean(args.config_section, 'guid skip', fallback=False):
+        args.GUID_skip = True
+
+    if args.dry_run:
+        args.download_skip = True
+        args.GUID_skip = True
+
+    return args
+
+# Ultimately we want the files to go on FAT32 volumes, so ensure filenames
+# don't have characters Microsoft says they can't handle. Reference:
+# https://docs.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+INVALID_FILENAME_CHARACTERS = re.compile(r'[\000-\037<>:"/\|?*]')
+def sanitize_filename(filename):
+    return INVALID_FILENAME_CHARACTERS.sub('#', filename)
+
+def url_extension(url_fd):
+    url = url_fd.geturl()
+    url_path = urllib.parse.urlparse(url).path
+    return Path(url_path).suffix
+
+def cover_png(url):
+    cover_f = io.BytesIO(urllib.request.urlopen(url).read())
+    cover = Image.open(cover_f).resize((300, 300)).convert('RGB')
+    cover_bytes = io.BytesIO()
+    cover.save(cover_bytes, format='PNG')
+    return cover_bytes.getvalue()
+
+def no_padding(_info):
+    return 0  # No need for tag padding in our audio files
+
+def save_episode(save_dir, feed_title, cover, episode, args):
+    url = episode['enclosures'][0]['url']
+    url_f = urllib.request.urlopen(url)
+    episode_f = io.BytesIO(url_f.read())
+
+    pub_dt = datetime.datetime.fromtimestamp(episode['published'],
+                                             datetime.timezone.utc)
+    title = f"{pub_dt:%y%m%d} {episode['title']}"
+    if not args.quiet:
+        print(f"  {title}")
+
+    audio = mutagen.File(episode_f)
+    audio.delete(episode_f)
+    audio.tags.add(TALB(encoding=Encoding.UTF16, text=feed_title))
+    audio.tags.add(TPE1(encoding=Encoding.UTF16, text=feed_title))
+    audio.tags.add(TIT2(encoding=Encoding.UTF16, text=title))
+    audio.tags.add(TCON(encoding=Encoding.LATIN1, text='Podcast'))
+    audio.tags.add(APIC(encoding=Encoding.LATIN1, mime='image/png', data=cover))
+    audio.tags.add(TLEN(encoding=Encoding.LATIN1,
+                        text=str(int(round(audio.info.length * 1000)))))
+    audio.tags.update_to_v23()
+    audio.tags.save(episode_f, v2_version=3, padding=no_padding)
+
+    filename = Path(sanitize_filename(title)).with_suffix(url_extension(url_f))
+    if not args.download_skip:
+        (save_dir / filename).write_bytes(episode_f.getvalue())
+
+def main():
+    args = get_args()
+
+    if args.download_skip:
+        print('As requested, podcast files will not be written.',
+              file=sys.stderr)
+    if args.GUID_skip:
+        print('As requested, the GUIDs of podcasts will not be stored.',
+              file=sys.stderr)
+
+    args.GUID_file.touch() # Ensure GUID file exists before using
+    with open(args.GUID_file, 'r+') as guid_file:
+
+        # Create a set of GUIDs that we have downloaded in the past so
+        # we can quickly check if a podcast needs to be downloaded.
+        guids = set(line.strip() for line in guid_file)
+
+        for feed in args.feeds:
+            # Create a dictionary of the feed
+            feed_dict = podcastparser.parse(feed, urllib.request.urlopen(feed))
+
+            if not args.quiet:
+                print(f"{feed_dict['title']}:")
+
+            # Ensure a directory for this feed exists in the download directory
+            feed_dir = args.download_directory / feed_dict['title']
+            feed_dir.mkdir(parents=True, exist_ok=True)
+
+            cover = cover_png(feed_dict['cover_url'])
+
+            for episode in feed_dict['episodes']:
+                # Skip if no content or already downloaded
+                if not episode['enclosures'] or episode['guid'] in guids:
+                    continue
+
+                save_episode(feed_dir, feed_dict['title'], cover, episode, args)
+
+                if not args.GUID_skip:
+                    print(episode['guid'], file=guid_file)
+                guids.add(episode['guid'])
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
