@@ -123,7 +123,7 @@ def save_episode(save_dir, feed_title, cover, episode, args):
                                              datetime.timezone.utc)
     title = f"{pub_dt:%y%m%d} {episode['title']}"
     if not args.quiet:
-        print(f"  {title}")
+        print(f"{feed_title} {title}")
 
     if args.download_skip:
         return
@@ -168,9 +168,6 @@ def main():
         for feed in args.feeds:
             # Create a dictionary of the feed
             feed_dict = podcastparser.parse(feed, urllib.request.urlopen(feed))
-
-            if not args.quiet:
-                print(f"{feed_dict['title']}:")
 
             # Ensure a directory for this feed exists in the download directory
             feed_dir = args.download_directory / feed_dict['title']
