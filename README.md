@@ -1,6 +1,34 @@
 # yappr
 Yet Another Python Podcast Retriever
 
+## Usage
+```
+usage: yappr [-h] [-F CONFIG_FILE] [-c CONFIG_SECTION] [-D DOWNLOAD_DIRECTORY]
+             [-G GUID_FILE] [-n] [-d] [-g] [-q]
+             [FEED [FEED ...]]
+
+yappr: Yet Another Python Podcast Retriever
+
+positional arguments:
+  FEED                  Fetch FEEDs instead of feeds from configuration file.
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -F CONFIG_FILE, --config-file CONFIG_FILE
+                        The configuration file to use.
+  -c CONFIG_SECTION, --config-section CONFIG_SECTION
+                        The section of the configuration file to use.
+  -D DOWNLOAD_DIRECTORY, --download-directory DOWNLOAD_DIRECTORY
+                        Directory to download podcasts to.
+  -G GUID_FILE, --GUID-file GUID_FILE
+                        File to track the GUIDs of downloaded podcasts.
+  -n, --dry-run         Do not write to local files (same as -d -g).
+  -d, --download-skip   Do not download podcasts.
+  -g, --GUID-skip       Do not write GUIDs to GUID-file.
+  -q, --quiet           Do not print episode titles.
+```
+
+## Overview of What it does
 I made this for my own purposes.  It's a relatively simple Python 3
 podcast retriever that works well with how I listen to podcasts on the
 devices that I use.  At a high level, it:
@@ -45,7 +73,8 @@ have consistent information.
 A file is kept of all the episode GUIDs that have already been saved
 so they are not downloaded again.
 
-A design goal was to only use Python modules that were available from
+### Requirements
+A design goal was to only use Python 3 modules that were available from
 Debian Stable repositories.  The required Debian packages as of
 2020-04-08 are:
 * python3-mutagen
