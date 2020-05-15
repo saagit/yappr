@@ -194,7 +194,11 @@ def main():
 
             # Ensure a directory for this feed exists in the download directory
             feed_dir = args.download_directory / feed_dict['title']
-            feed_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                feed_dir.mkdir(parents=True, exist_ok=True)
+            except (FileNotFoundError, PermissionError) as err:
+                print(f'Error accessing directory "{feed_dir}": {err}')
+                return 1
 
             cover = cover_png(feed_dict['cover_url'])
 
