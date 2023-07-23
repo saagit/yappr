@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright 2020 Scott A. Anderson
+# Copyright 2020, 2023 Scott A. Anderson
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -24,20 +24,21 @@
 
 # pylint: disable=C0111
 
-import datetime
-import io
-from pathlib import Path
-import re
-import sys
-
 import argparse
 import configparser
-import urllib.parse
-import urllib.request
+import datetime
+import io
+from http.client import IncompleteRead
+from pathlib import Path
+import re
+from shutil import copyfileobj
+import sys
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
+from PIL import Image
 import mutagen
 from mutagen.id3 import Encoding, APIC, TALB, TCON, TIT2, TLEN, TPE1
-from PIL import Image
 import podcastparser
 
 PROG_DESCRIPTION = 'yappr: Yet Another Python Podcast Retriever'
@@ -87,7 +88,7 @@ def get_args():
               file=sys.stderr)
         for key in sorted(invalid_config_keys):
             print(f' "{key}"', file=sys.stderr)
-        print(f'Valid config keys:', file=sys.stderr)
+        print('Valid config keys:', file=sys.stderr)
         for key in sorted(valid_config_keys):
             print(f' "{key}"', file=sys.stderr)
 
@@ -126,20 +127,30 @@ INVALID_FILENAME_CHARACTERS = re.compile(r'[\000-\037<>:"/\|?*]')
 def sanitize_filename(filename):
     return INVALID_FILENAME_CHARACTERS.sub('#', filename)
 
-def url_extension(url_fd):
-    url = url_fd.geturl()
-    url_path = urllib.parse.urlparse(url).path
-    return Path(url_path).suffix
-
 def cover_png(url):
-    cover_f = io.BytesIO(urllib.request.urlopen(url).read())
-    cover = Image.open(cover_f).resize((300, 300)).convert('RGB')
-    cover_bytes = io.BytesIO()
-    cover.save(cover_bytes, format='PNG')
-    return cover_bytes.getvalue()
+    with io.BytesIO(urlopen(url).read()) as cover_f:
+        cover = Image.open(cover_f).resize((300, 300)).convert('RGB')
+
+    with io.BytesIO() as cover_bytes:
+        cover.save(cover_bytes, format='PNG')
+        return cover_bytes.getvalue()
 
 def no_padding(_info):
     return 0  # No need for tag padding in our audio files
+
+def fetch_url(url, local_path):
+    num_retries = 6
+    for i in range(num_retries):
+        try:
+            with urlopen(url) as src, open(local_path, 'wb') as dst:
+                copyfileobj(src, dst)
+        except IncompleteRead:
+            print(f'  HTTP incomplete read: Retry {i+1} of {num_retries}',
+                  file=sys.stderr)
+        else:
+            return
+    print(f'Failed to read {url}', file=sys.stderr)
+    sys.exit(4)
 
 def save_episode(save_dir, feed_title, cover, episode, args):
     pub_dt = datetime.datetime.fromtimestamp(episode['published'],
@@ -152,11 +163,14 @@ def save_episode(save_dir, feed_title, cover, episode, args):
         return
 
     url = episode['enclosures'][0]['url']
-    url_f = urllib.request.urlopen(url)
-    episode_f = io.BytesIO(url_f.read())
+    extension = Path(urlparse(url).path).suffix
+    filename = Path(sanitize_filename(title)).with_suffix(extension)
+    episode_path = save_dir / filename
 
-    audio = mutagen.File(episode_f)
-    audio.delete(episode_f)
+    fetch_url(url, episode_path)
+
+    audio = mutagen.File(episode_path)
+    audio.delete()
     audio.tags.add(TALB(encoding=Encoding.UTF16, text=feed_title))
     audio.tags.add(TPE1(encoding=Encoding.UTF16, text=feed_title))
     audio.tags.add(TIT2(encoding=Encoding.UTF16, text=title))
@@ -165,10 +179,7 @@ def save_episode(save_dir, feed_title, cover, episode, args):
     audio.tags.add(TLEN(encoding=Encoding.LATIN1,
                         text=str(int(round(audio.info.length * 1000)))))
     audio.tags.update_to_v23()
-    audio.tags.save(episode_f, v2_version=3, padding=no_padding)
-
-    filename = Path(sanitize_filename(title)).with_suffix(url_extension(url_f))
-    (save_dir / filename).write_bytes(episode_f.getvalue())
+    audio.tags.save(episode_path, v2_version=3, padding=no_padding)
 
 def main():
     args = get_args()
@@ -181,8 +192,7 @@ def main():
               file=sys.stderr)
 
     args.GUID_file.touch() # Ensure GUID file exists before using
-    with open(args.GUID_file, 'r+') as guid_file:
-
+    with open(args.GUID_file, 'r+', encoding='utf-8') as guid_file:
         # Create a set of GUIDs that we have downloaded in the past so
         # we can quickly check if a podcast needs to be downloaded.
         guids = set(line.strip().split('\t', 1)[0]
@@ -190,30 +200,32 @@ def main():
         guid_written = False
         for feed in args.feeds:
             # Create a dictionary of the feed
-            feed_dict = podcastparser.parse(feed, urllib.request.urlopen(feed))
+            with urlopen(feed) as feed_f:
+                feed_dict = podcastparser.parse(feed, feed_f)
 
-            # Ensure a directory for this feed exists in the download directory
-            feed_dir = args.download_directory / feed_dict['title']
-            try:
-                feed_dir.mkdir(parents=True, exist_ok=True)
-            except (FileNotFoundError, PermissionError) as err:
-                print(f'Error accessing directory "{feed_dir}": {err}')
-                return 1
+                # Ensure a directory for this feed exists
+                feed_dir = args.download_directory / feed_dict['title']
+                try:
+                    feed_dir.mkdir(parents=True, exist_ok=True)
+                except (FileNotFoundError, PermissionError) as err:
+                    print(f'Error accessing directory "{feed_dir}": {err}')
+                    return 1
 
-            cover = cover_png(feed_dict['cover_url'])
+                cover = cover_png(feed_dict['cover_url'])
 
-            for episode in feed_dict['episodes']:
-                # Skip if no content or already downloaded
-                if not episode['enclosures'] or episode['guid'] in guids:
-                    continue
+                for episode in reversed(feed_dict['episodes']):
+                    # Skip if no content or already downloaded
+                    if not episode['enclosures'] or episode['guid'] in guids:
+                        continue
 
-                save_episode(feed_dir, feed_dict['title'], cover, episode, args)
+                    save_episode(feed_dir, feed_dict['title'],
+                                 cover, episode, args)
 
-                if not args.GUID_skip:
-                    print(f"{episode['guid']}\t{episode['title']}",
-                          file=guid_file)
-                    guid_written = True
-                guids.add(episode['guid'])
+                    if not args.GUID_skip:
+                        print(f"{episode['guid']}\t{episode['title']}",
+                              file=guid_file)
+                        guid_written = True
+                    guids.add(episode['guid'])
 
         if guid_written:
             print(f"# {datetime.datetime.now().isoformat()}: "
@@ -222,4 +234,7 @@ def main():
     return 0
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(3)
