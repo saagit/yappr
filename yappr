@@ -28,10 +28,9 @@ import argparse
 import configparser
 import datetime
 import io
-from http.client import IncompleteRead
 from pathlib import Path
 import re
-from shutil import copyfileobj
+import subprocess
 import sys
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -139,18 +138,11 @@ def no_padding(_info):
     return 0  # No need for tag padding in our audio files
 
 def fetch_url(url, local_path):
-    num_retries = 6
-    for i in range(num_retries):
-        try:
-            with urlopen(url) as src, open(local_path, 'wb') as dst:
-                copyfileobj(src, dst)
-        except IncompleteRead:
-            print(f'  HTTP incomplete read: Retry {i+1} of {num_retries}',
-                  file=sys.stderr)
-        else:
-            return
-    print(f'Failed to read {url}', file=sys.stderr)
-    sys.exit(4)
+    # Even catching IncompleteRead exceptions, I was still getting short files
+    # using urlopen().  I'm tired of playing this game so I'm just going to
+    # assume wget is installed and invoke it.
+    subprocess.run(['wget', '--quiet', f'--output-document={local_path}', url],
+                   check=True)
 
 def save_episode(save_dir, feed_title, cover, episode, args):
     pub_dt = datetime.datetime.fromtimestamp(episode['published'],
